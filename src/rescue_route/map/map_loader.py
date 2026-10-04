@@ -1,89 +1,314 @@
-# Map Loader Module for RescueRoute Environment.
-# Used to load benchmark map images (PNG) and metadata configs (JSON), 
-# parse static building obstacles vs free airspace, and extract base locations.
+"""
+Map loading and parsing for RescueRoute.
 
-import os
+The benchmark maps use one PNG pixel per grid cell.
+
+Benchmark color semantics:
+    RED    #FF0000 -> No-Fly Zone (NFZ)
+    GREEN  #00FF00 -> Building, but UAV can fly over
+    BLUE   #0000FF -> Start / Landing Zone
+    YELLOW #FFFF00 -> Building + NFZ, UAV cannot fly over
+
+RescueRoute keeps these semantics as separate masks so that the
+environment can later distinguish:
+    - hard flight obstacles
+    - no-fly zones
+    - fly-over structures
+    - valid base / landing cells
+    - free airspace
+"""
+
+from __future__ import annotations
+
 import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 from PIL import Image
-from dataclasses import dataclass
-from typing import Tuple, List, Optional
 
 
-# Data container class holding parsed grid map data and metadata.
-# Used across the environment, pathfinder, and visualization engine to query map bounds and obstacles.
+# ---------------------------------------------------------------------
+# RGB color definitions from the benchmark
+# ---------------------------------------------------------------------
+
+RED = np.array([255, 0, 0], dtype=np.uint8)
+GREEN = np.array([0, 255, 0], dtype=np.uint8)
+BLUE = np.array([0, 0, 255], dtype=np.uint8)
+YELLOW = np.array([255, 255, 0], dtype=np.uint8)
+
+
+# ---------------------------------------------------------------------
+# Data container
+# ---------------------------------------------------------------------
+
 @dataclass
 class MapData:
-    name: str                           # Map identifier name (e.g. 'manhattan32' or 'urban50')
-    width: int                          # Grid map width in cells (e.g. 32 or 50)
-    height: int                         # Grid map height in cells (e.g. 32 or 50)
-    grid_map: np.ndarray                # 2D integer array (0 = FREE AIRSPACE, 1 = BUILDING OBSTACLE)
-    raw_image: np.ndarray               # Original RGB image array loaded from PNG
-    base_locations: List[Tuple[int, int]]# List of available drone base/landing coordinates (x, y)
-    config: dict                        # Full raw configuration dictionary from JSON config
+    """
+    Parsed RescueRoute map.
+
+    Coordinate convention:
+        (x, y)
+        x -> column
+        y -> row
+
+    Array convention:
+        array[y, x]
+    """
+
+    name: str
+
+    width: int
+    height: int
+
+    # Original PNG image
+    raw_image: np.ndarray
+
+    # Semantic masks
+    nfz_mask: np.ndarray
+    fly_over_building_mask: np.ndarray
+    blocked_mask: np.ndarray
+    base_mask: np.ndarray
+    free_mask: np.ndarray
+
+    # Backward-compatible main navigation grid:
+    #   0 -> traversable
+    #   1 -> blocked
+    grid_map: np.ndarray
+
+    # Coordinates of valid start / landing cells
+    base_locations: List[Tuple[int, int]]
+
+    # Original JSON configuration
+    config: Dict
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        """Return map shape as (height, width)."""
+        return self.height, self.width
+
+    def is_inside(self, x: int, y: int) -> bool:
+        """Return True when (x, y) lies inside the map."""
+        return 0 <= x < self.width and 0 <= y < self.height
+
+    def is_blocked(self, x: int, y: int) -> bool:
+        """Return True if the UAV cannot fly through this cell."""
+        if not self.is_inside(x, y):
+            return True
+
+        return bool(self.blocked_mask[y, x])
+
+    def is_nfz(self, x: int, y: int) -> bool:
+        """Return True if the cell belongs to an NFZ."""
+        if not self.is_inside(x, y):
+            return False
+
+        return bool(self.nfz_mask[y, x])
+
+    def is_base(self, x: int, y: int) -> bool:
+        """Return True if the cell is a valid base / landing cell."""
+        if not self.is_inside(x, y):
+            return False
+
+        return bool(self.base_mask[y, x])
+
+    def traversable_cells(self) -> np.ndarray:
+        """
+        Return coordinates of all traversable cells as an N x 2 array.
+
+        Each row is [x, y].
+        """
+        ys, xs = np.where(~self.blocked_mask)
+        return np.column_stack((xs, ys))
 
 
-# Load PNG image and JSON config for a specified map dataset.
-# Parameters:
-#   map_name: Name of map folder inside data/maps/ ('manhattan32' or 'urban50')
-#   base_dir: Root project directory path
-# Returns:
-#   MapData object containing obstacle masks and map dimensions.
-def load_map(map_name: str = "manhattan32", base_dir: Optional[str] = None) -> MapData:
-    # If base_dir is not provided, resolve path relative to repository root directory
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+def _project_root() -> Path:
+    """
+    Resolve the repository root.
+
+    map_loader.py is expected at:
+        <root>/src/rescue_route/map/map_loader.py
+    """
+    return Path(__file__).resolve().parents[3]
+
+
+def _color_mask(image: np.ndarray, color: np.ndarray) -> np.ndarray:
+    """Return a boolean mask for exact RGB color matches."""
+    return np.all(image == color, axis=-1)
+
+
+def _load_config(json_path: Path) -> Dict:
+    """Load benchmark JSON configuration."""
+    with json_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------
+# Public loader
+# ---------------------------------------------------------------------
+
+def load_map(
+    map_name: str = "manhattan32",
+    base_dir: Optional[str] = None,
+) -> MapData:
+    """
+    Load and parse a RescueRoute benchmark map.
+
+    Expected directory:
+
+        data/
+        └── maps/
+            └── <map_name>/
+                ├── map.png
+                └── config.json
+
+    Parameters
+    ----------
+    map_name:
+        Map directory name, for example:
+        "manhattan32" or "urban50"
+
+    base_dir:
+        Optional repository root override.
+
+    Returns
+    -------
+    MapData
+        Parsed map representation.
+    """
+
+    # -------------------------------------------------------------
+    # Resolve paths
+    # -------------------------------------------------------------
+
     if base_dir is None:
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        root = _project_root()
+    else:
+        root = Path(base_dir).resolve()
 
-    map_folder = os.path.join(base_dir, "data", "maps", map_name)
-    png_path = os.path.join(map_folder, "map.png")
-    json_path = os.path.join(map_folder, "config.json")
+    map_folder = root / "data" / "maps" / map_name
 
-    # Ensure map files exist before trying to read them
-    if not os.path.exists(png_path) or not os.path.exists(json_path):
+    png_path = map_folder / "map.png"
+    json_path = map_folder / "config.json"
+
+    if not png_path.exists():
         raise FileNotFoundError(
-            f"Map files not found for '{map_name}' at '{map_folder}'. "
-            "Please run data download script first."
+            f"Map PNG not found:\n{png_path}"
         )
 
-    # Load PNG image using PIL and convert to RGB numpy matrix
+    if not json_path.exists():
+        raise FileNotFoundError(
+            f"Map JSON/config not found:\n{json_path}"
+        )
+
+    # -------------------------------------------------------------
+    # Load image
+    # -------------------------------------------------------------
+
     img = Image.open(png_path).convert("RGB")
-    raw_img = np.array(img)
-    height, width, _ = raw_img.shape
+    raw_image = np.asarray(img, dtype=np.uint8)
 
-    # Read JSON configuration metadata file
-    with open(json_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
+    if raw_image.ndim != 3 or raw_image.shape[2] != 3:
+        raise ValueError(
+            f"Expected RGB image with shape (H, W, 3), "
+            f"got {raw_image.shape}"
+        )
 
-    # Create 2D grid matrix where 1 represents building/obstacle and 0 represents navigable airspace.
-    # In benchmark map PNGs:
-    # - Black pixels [0, 0, 0] are BUILDING OBSTACLES (grid = 1)
-    # - Non-black colored pixels (blue bases, yellow roads, green/red zones) are FREE AIRSPACE (grid = 0)
-    grid = np.zeros((height, width), dtype=np.int32)
-    base_locs = []
+    height, width, _ = raw_image.shape
 
-    for y in range(height):
-        for x in range(width):
-            r, g, b = raw_img[y, x]
-            if r == 0 and g == 0 and b == 0:
-                grid[y, x] = 1 # Mark cell as BUILDING OBSTACLE
-            elif r < 50 and g < 50 and b > 200:
-                # Blue pixels mark base stations
-                base_locs.append((x, y))
+    # -------------------------------------------------------------
+    # Load JSON metadata
+    # -------------------------------------------------------------
 
-    # If no blue base pixels found in image, check JSON config or use corners
-    if not base_locs:
-        if "bases" in config and isinstance(config["bases"], list):
-            for b in config["bases"]:
-                base_locs.append((int(b[0]), int(b[1])))
-        else:
-            base_locs = [(2, 2), (width - 3, height - 3), (2, height - 3), (width - 3, 2)]
+    config = _load_config(json_path)
+
+    # -------------------------------------------------------------
+    # Decode benchmark colors
+    # -------------------------------------------------------------
+
+    red_mask = _color_mask(raw_image, RED)
+    green_mask = _color_mask(raw_image, GREEN)
+    blue_mask = _color_mask(raw_image, BLUE)
+    yellow_mask = _color_mask(raw_image, YELLOW)
+
+    # -------------------------------------------------------------
+    # Semantic layers
+    # -------------------------------------------------------------
+
+    # Red = NFZ
+    nfz_mask = red_mask.copy()
+
+    # Green = building that UAV can fly over
+    fly_over_building_mask = green_mask.copy()
+
+    # Red = NFZ
+    # Yellow = building + NFZ
+    # Neither is flyable.
+    blocked_mask = nfz_mask | yellow_mask
+
+    # Blue = valid starting / landing area
+    base_mask = blue_mask.copy()
+
+    # All cells that are not hard blocked are traversable.
+    free_mask = ~blocked_mask
+
+    # Keep the old grid_map interface for existing code:
+    #
+    #   0 = traversable
+    #   1 = blocked
+    #
+    grid_map = blocked_mask.astype(np.int8)
+
+    # -------------------------------------------------------------
+    # Extract base coordinates
+    # -------------------------------------------------------------
+
+    ys, xs = np.where(base_mask)
+    base_locations: List[Tuple[int, int]] = list(
+        zip(xs.tolist(), ys.tolist())
+    )
+
+    # -------------------------------------------------------------
+    # Validation
+    # -------------------------------------------------------------
+
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            f"Invalid map dimensions: width={width}, height={height}"
+        )
+
+    if not base_locations:
+        raise ValueError(
+            f"No blue start/landing cells were found in map "
+            f"'{map_name}'. Check map.png color semantics."
+        )
+
+    # A base should never be blocked.
+    if np.any(base_mask & blocked_mask):
+        raise ValueError(
+            f"Map '{map_name}' contains base cells marked as blocked."
+        )
+
+    # -------------------------------------------------------------
+    # Build object
+    # -------------------------------------------------------------
 
     return MapData(
         name=map_name,
         width=width,
         height=height,
-        grid_map=grid,
-        raw_image=raw_img,
-        base_locations=base_locs,
-        config=config
+        raw_image=raw_image,
+        nfz_mask=nfz_mask,
+        fly_over_building_mask=fly_over_building_mask,
+        blocked_mask=blocked_mask,
+        base_mask=base_mask,
+        free_mask=free_mask,
+        grid_map=grid_map,
+        base_locations=base_locations,
+        config=config,
     )
